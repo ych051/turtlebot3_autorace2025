@@ -1,0 +1,7 @@
+<launch>
+
+    <node pkg="detect" type="4_detect_parking_yolo" name="detect_parking_yolo" output="screen">
+        <remap from="/image_input" to="/camera/image/compressed"/>
+    </node>
+    
+</launch>

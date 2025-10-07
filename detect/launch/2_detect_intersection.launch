@@ -1,0 +1,7 @@
+<launch>
+
+    <node pkg="detect" type="2_detect_intersection_yolo" name="detect_intersection_yolo" output="screen">
+        <remap from="/image_input" to="/camera/image/compressed"/>
+    </node>
+    
+</launch>

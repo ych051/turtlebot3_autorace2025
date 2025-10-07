@@ -1,0 +1,267 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import rospy, math
+import numpy as np
+import os
+import cv2
+import tf
+from enum import Enum
+from ultralytics import YOLO
+from std_msgs.msg import UInt8, Float64, String
+from sensor_msgs.msg import LaserScan
+from sensor_msgs.msg import CompressedImage, LaserScan
+from geometry_msgs.msg import Twist, PoseStamped, PoseWithCovarianceStamped
+from move_base_msgs.msg import MoveBaseActionResult
+from cv_bridge import CvBridge, CvBridgeError
+from nav_msgs.msg import Odometry
+from turtlebot3_autorace_msgs.msg import MovingParam
+
+class DetectSign():
+    def __init__(self):
+        self.fnPreproc()
+
+        # subscribes compressed image   
+        self.sub_img = rospy.Subscriber('/image_input', CompressedImage, self.cbFindTrafficSign, queue_size = 1)
+        self.sub_moving_completed = rospy.Subscriber('/control/moving/complete', UInt8, self.cbMovingComplete, queue_size = 1)
+        
+        self.sub_odom = rospy.Subscriber('/odom', Odometry, self.cbOdom, queue_size=1)
+        self.sub_arrival_status = rospy.Subscriber("/move_base/result", MoveBaseActionResult, self.cbGetNavigationResult, queue_size=1)
+        
+
+        # publishes next mission
+        self.pub_mission = rospy.Publisher('/mission', UInt8, queue_size=1)
+        self.pub_mission_tunnel = rospy.Publisher('/mission/tunnel', UInt8, queue_size=1)
+        self.pub_max_vel = rospy.Publisher('/control/max_vel', Float64, queue_size = 1)
+        
+        self.pub_moving = rospy.Publisher('/control/moving/state', MovingParam, queue_size= 1)
+        self.pub_cmd_vel = rospy.Publisher('/control/cmd_vel', Twist, queue_size = 1)
+        self.pub_tunnel_return = rospy.Publisher('/detect/tunnel_stamped', UInt8, queue_size=1)
+        self.pub_goal_pose_stamped = rospy.Publisher("/move_base_simple/goal", PoseStamped, queue_size=1)
+        self.pub_init_pose = rospy.Publisher("/initialpose", PoseWithCovarianceStamped, queue_size=1)
+
+        # publishes traffic sign image in compressed type 
+        self.pub_image_traffic_sign = rospy.Publisher('/detect/sign/compressed', CompressedImage, queue_size = 1)
+
+
+        self.Mission = Enum('Mission', 'Idle TrafficLight Intersection Construction Parking LevelCrossing Tunnel')
+        self.TunnelStep = Enum('TunnelStep', 'default process nav end')
+        self.current_step_tunel = self.TunnelStep.default.value
+        
+        self.cvBridge = CvBridge()
+        self.counter = 1
+
+        self.is_saw_tunnel = True
+        self.start_obstacle_detection = False
+        self.is_moving_complete = False
+        self.is_navigation_finished = False
+        self.is_tunnel_finished = False
+
+        self.last_current_theta = 0.0
+
+
+    def cbMovingComplete(self, data):
+        self.is_moving_complete = True
+
+    def cbGetNavigationResult(self, msg_nav_result):
+        if msg_nav_result.status.status == 3:
+            rospy.loginfo("\t[TUNNEL] GOAL!!")
+            self.is_navigation_finished = True
+
+
+    def fnPreproc(self):
+        model_path = os.path.expanduser("~/detect/train/weights/best.pt")
+        if not os.path.exists(model_path):
+            rospy.loginfo("모델 파일을 찾을 수 없습니다")
+            rospy.loginfo("기본 모델 yolov8n.pt 를 대신 사용합니다.")
+            model_path = "yolov8n.pt"
+
+        self.model = YOLO(model_path)
+        rospy.loginfo("YOLO 모델 로드 완료")
+
+    def cbFindTrafficSign(self, image_msg):
+
+        np_arr = np.frombuffer(image_msg.data, np.uint8)
+        cv_image_input = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+
+        results = self.model.predict(cv_image_input, imgsz=320, conf=0.6, verbose=False)
+        
+        for r in results:
+            for box in r.boxes:
+                cls_id = int(box.cls[0])
+                label = self.model.names[cls_id]
+                conf = float(box.conf[0])
+                x1, y1, x2, y2 = map(int, box.xyxy[0])
+
+                if label == "tunnel" and not self.is_saw_tunnel:
+                    rospy.loginfo("detect tunnel")
+                    self.is_saw_tunnel = True
+                    self.counter = 2
+        
+        out_img = results[0].plot()
+        self.pub_image_traffic_sign.publish(self.cvBridge.cv2_to_compressed_imgmsg(out_img, "jpg"))
+                    
+
+        if self.is_saw_tunnel == True and self.counter == 2:
+
+            self.pub_mission_tunnel.publish(self.TunnelStep.process.value)
+
+            rospy.sleep(2)
+
+            rospy.loginfo("[Tunnel] MOTION...")
+
+            self.lastError = 0.0
+            self.start_pos_x = self.current_pos_x
+            self.start_pos_y = self.current_pos_y
+
+            while True:
+                error = self.fnStraight(0.6)
+
+                if math.fabs(error) < 0.005:
+                    break
+
+            self.fnStop()
+
+            self.pub_mission_tunnel.publish(self.TunnelStep.nav.value)
+
+            rospy.loginfo("[TUNNEL] NAVIGATION...")
+            # initialPose = PoseWithCovarianceStamped()
+            # initialPose.header.frame_id = "map"
+            # initialPose.header.stamp = rospy.Time.now()
+            # initialPose.pose.pose = self.odom_msg.pose.pose
+
+            # self.pub_init_pose.publish(initialPose)
+            rospy.sleep(3)
+
+            self.fnPubGoalPose()
+
+
+            while True:
+                if self.is_navigation_finished == True:
+                    break
+                else:
+                    pass
+
+            rospy.sleep(2)
+
+            rospy.loginfo("[TUNNEL] FINISH & GO_OUT...")
+
+            self.lastError = 0.0
+            self.start_pos_x = self.current_pos_x
+            self.start_pos_y = self.current_pos_y
+
+            while True:
+                error = self.fnStraight(0.14)
+
+                if math.fabs(error) < 0.005:
+                    break
+
+            self.fnStop()
+            
+            self.current_step_tunnel = self.TunnelStep.end.value
+            self.pub_mission_tunnel.publish(self.current_step_tunnel)
+
+            #self.current_mission = self.Mission.LevelCrossing.value
+            #self.pub_mission.publish(self.current_mission)
+            self.counter = 1
+
+
+    def cbOdom(self, odom_msg):
+        quaternion = (odom_msg.pose.pose.orientation.x, odom_msg.pose.pose.orientation.y, odom_msg.pose.pose.orientation.z, odom_msg.pose.pose.orientation.w)
+        self.current_theta = self.euler_from_quaternion(quaternion)
+        self.odom_msg = odom_msg
+        if (self.current_theta - self.last_current_theta) < -math.pi:
+            self.current_theta = 2. * math.pi + self.current_theta
+            self.last_current_theta = math.pi
+        elif (self.current_theta - self.last_current_theta) > math.pi:
+            self.current_theta = -2. * math.pi + self.current_theta
+            self.last_current_theta = -math.pi
+        else:
+            self.last_current_theta = self.current_theta
+
+        self.current_pos_x = odom_msg.pose.pose.position.x
+        self.current_pos_y = odom_msg.pose.pose.position.y
+
+    def euler_from_quaternion(self, quaternion):
+        theta = tf.transformations.euler_from_quaternion(quaternion)[2]
+        return theta
+
+    def fnPubGoalPose(self):
+        goalPoseStamped = PoseStamped()
+
+        goalPoseStamped.header.frame_id = "map"
+        goalPoseStamped.header.stamp = rospy.Time.now()
+
+        goalPoseStamped.pose.position.x = -0.3
+        goalPoseStamped.pose.position.y = -1.74
+        goalPoseStamped.pose.position.z = 0.0
+
+        goalPoseStamped.pose.orientation.x = 0.0
+        goalPoseStamped.pose.orientation.y = 0.0
+        goalPoseStamped.pose.orientation.z = 0.0
+        goalPoseStamped.pose.orientation.w = 1.0
+
+        self.pub_goal_pose_stamped.publish(goalPoseStamped)
+
+    def fnStraight(self, desired_dist):
+        err_pos = math.sqrt((self.current_pos_x - self.start_pos_x) ** 2 + (self.current_pos_y - self.start_pos_y) ** 2) - desired_dist
+        
+        rospy.loginfo("Tunnel_Straight")
+        rospy.loginfo("err_pos  desired_dist : %f  %f  %f", err_pos, desired_dist, self.lastError)
+
+        Kp = 0.4
+        Kd = 0.05
+
+        angular_z = Kp * err_pos + Kd * (err_pos - self.lastError)
+        self.lastError = err_pos
+
+        twist = Twist()
+        twist.linear.x = 0.15
+        twist.linear.y = 0
+        twist.linear.z = 0
+        twist.angular.x = 0
+        twist.angular.y = 0
+        twist.angular.z = 0.03
+        self.pub_cmd_vel.publish(twist)
+
+        return err_pos
+
+    def fnStop(self):
+        twist = Twist()
+        twist.linear.x = 0
+        twist.linear.y = 0
+        twist.linear.z = 0
+        twist.angular.x = 0
+        twist.angular.y = 0
+        twist.angular.z = 0
+        self.pub_cmd_vel.publish(twist)
+
+    def cbTunnelFinished(self, tunnel_finished_msg):
+        self.is_tunnel_finished = True
+        
+    def main(self):
+        rospy.spin()
+
+if __name__ == '__main__':
+    rospy.init_node('detect_tunnel_yolo')
+    node = DetectSign()
+    node.main()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

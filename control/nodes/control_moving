@@ -64,11 +64,9 @@ class ControlMoving():
         self.current_theta = 0.0
         self.last_current_theta = 0.0
         self.lastError = 0.0
-
-        self.test = math.radians(90)
      
         msg_pub_max_vel = Float64()
-        msg_pub_max_vel.data = 0.05
+        msg_pub_max_vel.data = 2
         self.pub_max_vel.publish(msg_pub_max_vel)
 
         loop_rate = rospy.Rate(100) # 10hz
@@ -209,7 +207,7 @@ class ControlMoving():
         err_theta = self.current_theta - self.desired_theta
         
         # rospy.loginfo("err_theta  desired_theta  current_theta : %f  %f  %f", err_theta, self.desired_theta, self.current_theta)
-        Kp = 0.45
+        Kp = 0.9
         Kd = 0.03
 
         angular_z = Kp * err_theta + Kd * (err_theta - self.lastError)

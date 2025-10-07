@@ -1,5 +1,3 @@
 <launch>
-
   <node pkg="control" type="control_moving" name="control_moving" output="screen"/>
-
 </launch>

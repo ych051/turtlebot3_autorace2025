@@ -1,0 +1,193 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+import rospy, os, cv2, math
+import numpy as np
+from enum import Enum
+from ultralytics import YOLO
+from std_msgs.msg import UInt8, Float64, Bool
+from sensor_msgs.msg import CompressedImage, LaserScan
+from cv_bridge import CvBridge
+from nav_msgs.msg import Odometry
+from geometry_msgs.msg import Twist
+from turtlebot3_autorace_msgs.msg import MovingParam
+
+class DetectSign():
+    def __init__(self):
+        #self.fnPreproc()
+
+        self.Mission = Enum('Mission', 'Idle TrafficLight Intersection Construction Parking LevelCrossing Tunnel')
+        self.ParkingStep = Enum('ParkingStep', 'default process')
+        self.current_step_parking = self.ParkingStep.default.value
+
+        self.sub_img = rospy.Subscriber('/image_input', CompressedImage, self.cbFindTrafficSign, queue_size = 1)
+        self.sub_moving_completed = rospy.Subscriber('/control/moving/complete', UInt8, self.cbMovingComplete, queue_size = 1)
+        self.sub_scan_obstacle = rospy.Subscriber('/scan', LaserScan, self.cbScanObstacle, queue_size=1)
+
+        self.pub_mission = rospy.Publisher('/mission', UInt8, queue_size=1)
+        self.pub_mission_parking = rospy.Publisher('/mission/parking', UInt8, queue_size=1)
+        self.pub_max_vel = rospy.Publisher('/control/max_vel', Float64, queue_size = 1)
+        self.pub_fake_lane = rospy.Publisher('/control/lane', Float64, queue_size=1)
+        self.pub_moving = rospy.Publisher('/control/moving/state', MovingParam, queue_size= 1)
+        self.pub_cmd_vel = rospy.Publisher('/cmd_vel', Twist, queue_size=1)
+
+        self.pub_lane_toggle = rospy.Publisher('/detect/lane_toggle', Bool, queue_size=1)
+        self.pub_white_toggle = rospy.Publisher('/detect/white_toggle', Bool, queue_size=1)
+
+        self.pub_image_traffic_sign = rospy.Publisher('/detect/sign/compressed', CompressedImage, queue_size = 1)
+
+        self.cvBridge = CvBridge()
+        self.counter = 1
+
+        self.is_saw_parking = True
+        self.start_obstacle_detection = False
+        self.is_moving_complete = False
+        self.is_obstacle_detected_R = False
+        self.is_obstacle_detected_L = False
+
+    def cbMovingComplete(self, data):
+        self.is_moving_complete = True
+
+    def fnPreproc(self):
+        model_path = os.path.expanduser("~/detect/train/weights/best.pt")
+        if not os.path.exists(model_path):
+            rospy.loginfo("기본 모델 yolov8n.pt 를 대신 사용합니다.")
+            model_path = "yolov8n.pt"
+
+        self.model = YOLO(model_path)
+        rospy.loginfo("YOLO 모델 로드 완료")
+
+    def cbScanObstacle(self, scan):
+        #    왼쪽 175~180
+        #    앞   115~120
+        #    오른쪽 55~60
+        scan_start_left = 145
+        scan_end_left = 150
+
+        scan_start_right = 80
+        scan_end_right = 85
+
+        threshold_distance = 0.45
+        
+        if self.start_obstacle_detection == True:
+            rospy.loginfo('scan')
+            for i in range(scan_start_left, scan_end_left):
+                if scan.ranges[i] < threshold_distance and scan.ranges[i] > 0.15:
+                    self.is_obstacle_detected_L = True
+                    rospy.loginfo("left detected")
+                    self.start_obstacle_detection = False
+            
+            for i in range(scan_start_right, scan_end_right):
+                if scan.ranges[i] < threshold_distance and scan.ranges[i] > 0.15:
+                    self.is_obstacle_detected_R = True
+                    rospy.loginfo("right detected")
+                    self.start_obstacle_detection = False
+
+    def cbFindTrafficSign(self, image_msg):
+        np_arr = np.frombuffer(image_msg.data, np.uint8)
+        cv_image_input = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+
+        # results = self.model.predict(cv_image_input, imgsz=320, conf=0.6, verbose=False)
+        
+        # for r in results:
+        #     for box in r.boxes:
+        #         cls_id = int(box.cls[0])
+        #         label = self.model.names[cls_id]
+        #         conf = float(box.conf[0])
+        #         x1, y1, x2, y2 = map(int, box.xyxy[0])
+
+        #         if label == "parking" and not self.is_saw_parking:
+        #             rospy.loginfo("detect parking")
+        #             self.is_saw_parking = True
+        
+        # out_img = results[0].plot()
+        # self.pub_image_traffic_sign.publish(self.cvBridge.cv2_to_compressed_imgmsg(out_img, "jpg"))
+            
+        # parking process
+        if self.is_saw_parking == True: 
+            self.pub_mission_parking.publish(self.ParkingStep.process.value)
+
+            self.start_obstacle_detection = True
+
+            while True:
+                if self.is_obstacle_detected_L == True or self.is_obstacle_detected_R == True:
+                    self.start_obstacle_detection = False
+                    self.pub_lane_toggle.publish(False)
+                    for x in range(0, 25):
+                        self.pub_fake_lane.publish(500)
+                        rospy.sleep(0.1)
+                    break
+            rospy.loginfo("[PARKING] PARKING...")
+            if self.is_obstacle_detected_L == True:
+                rospy.loginfo("[PARKING] RIGHT_CLEAR")
+                msg_moving = MovingParam()
+
+                rospy.loginfo("[PARKING] L")
+                msg_moving.moving_type=2
+                msg_moving.moving_value_angular=90
+                msg_moving.moving_value_linear=0.0
+                self.pub_moving.publish(msg_moving)
+                while True:
+                    if self.is_moving_complete == True:
+                        break
+                self.is_moving_complete = False
+                rospy.sleep(0.05)
+                
+                rospy.loginfo("[PARKING] B")
+                msg_moving.moving_type= 5
+                msg_moving.moving_value_angular=0.0
+                msg_moving.moving_value_linear=0.22
+                self.pub_moving.publish(msg_moving)
+                while True:
+                    if self.is_moving_complete == True:
+                        break
+                self.is_moving_complete = False
+                #rospy.sleep(2)
+                rospy.loginfo("[PARKING] L OUT")
+                for x in range(0, 20):
+                    self.pub_fake_lane.publish(400)
+                    rospy.sleep(0.1)
+            
+            elif self.is_obstacle_detected_R == True:
+                rospy.loginfo("[PARKING] LEFT_CLEAR")
+                msg_moving = MovingParam()
+
+                rospy.loginfo("[PARKING] R")
+                msg_moving.moving_type=3
+                msg_moving.moving_value_angular=90
+                msg_moving.moving_value_linear=0.0
+                self.pub_moving.publish(msg_moving)
+                while True:
+                    if self.is_moving_complete == True:
+                        break
+                self.is_moving_complete = False
+                rospy.sleep(0.05)
+                
+                rospy.loginfo("[PARKING] B")
+                msg_moving.moving_type= 5
+                msg_moving.moving_value_angular=0.0
+                msg_moving.moving_value_linear=0.25
+                self.pub_moving.publish(msg_moving)
+                while True:
+                    if self.is_moving_complete == True:
+                        break
+                self.is_moving_complete = False
+                #rospy.sleep(2)
+                rospy.loginfo("[PARKING] R OUT")
+                for x in range(0, 20):
+                    self.pub_fake_lane.publish(600)
+                    rospy.sleep(0.1)
+
+            self.pub_lane_toggle.publish(True)
+            rospy.sleep(10)
+            self.pub_white_toggle.publish(True)
+            rospy.loginfo("[PARKING] FINISH...")
+            # go to next mission
+            self.pub_mission.publish(self.Mission.LevelCrossing.value)
+
+    def main(self):
+        rospy.spin()
+
+if __name__ == '__main__':
+    rospy.init_node('4_detect_parking_yolo')
+    node = DetectSign()
+    node.main()

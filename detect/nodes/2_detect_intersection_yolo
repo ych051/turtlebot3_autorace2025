@@ -1,0 +1,127 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import rospy, os, cv2
+import numpy as np
+from enum import Enum
+from ultralytics import YOLO
+from std_msgs.msg import UInt8, Float64, Bool
+from sensor_msgs.msg import CompressedImage
+from cv_bridge import CvBridge
+from nav_msgs.msg import Odometry
+from geometry_msgs.msg import Twist
+
+class DetectSign():
+    def __init__(self):
+        self.fnPreproc()
+        # subscribes compressed image
+        self.sub_img = rospy.Subscriber('/image_input', CompressedImage, self.cbFindTrafficSign, queue_size = 1)
+        self.sub_odom = rospy.Subscriber('/odom', Odometry, self.cbOdom, queue_size=1)
+        # publishes next mission
+        self.pub_mission = rospy.Publisher('/mission', UInt8, queue_size=1)
+        self.pub_mission_step = rospy.Publisher('/mission/intersection', UInt8, queue_size=1)
+        self.pub_fake_lane = rospy.Publisher('/control/lane', Float64, queue_size=1)
+        self.pub_cmd_vel = rospy.Publisher('/cmd_vel', Twist, queue_size=1)
+
+        self.pub_bot_x = rospy.Publisher('/detect/lane_bot_x', UInt8, queue_size=1)
+        self.pub_top_y = rospy.Publisher('/detect/lane_top_y', UInt8, queue_size=1)
+        
+        self.pub_lane_toggle = rospy.Publisher('/detect/lane_toggle', Bool, queue_size=1)
+        self.pub_white_toggle = rospy.Publisher('/detect/white_toggle', Bool, queue_size=1)
+        self.pub_yellow_toggle = rospy.Publisher('/detect/yellow_toggle', Bool, queue_size=1)
+
+        self.pub_image_traffic_sign = rospy.Publisher('/detect/sign/compressed', CompressedImage, queue_size = 1)
+
+        self.Mission = Enum('Mission', 'Idle TrafficLight Intersection Construction Parking LevelCrossing Tunnel')
+        self.IntersectionStep = Enum('IntersectionStep', 'default process done')
+        self.current_step = self.IntersectionStep.default.value
+        
+        self.cvBridge = CvBridge()
+
+        self.current_orientation_w = 0.0
+
+        self.is_saw_intersection = False
+        self.is_saw_left_count = 0
+        self.is_saw_right_count = 0
+        self.is_saw_left = False
+        self.is_saw_right = False
+
+    def cbOdom(self, odom_msg):
+        self.current_orientation_w = odom_msg.pose.pose.orientation.w
+
+    def fnPreproc(self):
+        model_path = os.path.expanduser("~/test_imgs/runs/detect/train2/weights/best.pt")
+        if not os.path.exists(model_path):
+            rospy.loginfo("모델 파일을 찾을 수 없습니다")
+            model_path = "yolov8n.pt"
+
+        self.model = YOLO(model_path)
+        rospy.loginfo("YOLO 모델 로드 완료")
+
+    def cbFindTrafficSign(self, image_msg):
+        np_arr = np.frombuffer(image_msg.data, np.uint8)
+        cv_image_input = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+
+        results = self.model.predict(cv_image_input, imgsz=320, conf=0.2, verbose=False)
+        
+        for r in results:
+            for box in r.boxes:
+                cls_id = int(box.cls[0])
+                label = self.model.names[cls_id]
+                conf = float(box.conf[0])
+                x1, y1, x2, y2 = map(int, box.xyxy[0])
+
+                # 결과에 따른 상태 변경 X값 y값도 지정해야함
+                
+                if label == "intersection" and not self.is_saw_intersection:
+                    rospy.loginfo("Intersection sign detected")
+                    self.is_saw_intersection = True
+
+                elif label == "left" and not self.is_saw_left:
+                    self.is_saw_left_count += 1
+                    if self.is_saw_left_count >= 2:
+                        self.is_saw_left = True
+                        rospy.loginfo("Left sign detected")
+
+                elif label == "right" and not self.is_saw_right:
+                    self.is_saw_right_count += 1
+                    if self.is_saw_right_count >= 2:
+                        self.is_saw_right = True
+                        rospy.loginfo("Right sign detected")
+        
+        out_img = results[0].plot()
+        self.pub_image_traffic_sign.publish(self.cvBridge.cv2_to_compressed_imgmsg(out_img, "jpg"))
+        if not label_detect:
+            rospy.loginfo("라벨X")
+        # inter section process
+        if self.is_saw_intersection == True and self.current_step == self.IntersectionStep.default.value:
+            if self.current_orientation_w <= 0.1 and self.current_orientation_w >= -0.1 :
+                self.current_step = self.IntersectionStep.process.value
+                #self.pub_lane_toggle.publish(True)
+        
+        # 여기서 흰선 노란선의 토글을 끄면 왼쪽 오른쪽 조절 가능??
+        if (self.is_saw_left == True or self.is_saw_right == True) and self.current_step == self.IntersectionStep.process.value:
+            if self.is_saw_right == True:
+                rospy.loginfo('RIGHT->')
+                #self.pub_lane_toggle.publish(True)
+                self.pub_white_toggle.publish(True)
+                self.pub_yellow_toggle.publish(False)
+                rospy.sleep(10)
+
+            elif self.is_saw_left == True:
+                rospy.loginfo('<-LEFT')
+                #self.pub_lane_toggle.publish(True)
+                self.pub_white_toggle.publish(False)
+                self.pub_yellow_toggle.publish(True)
+                rospy.sleep(10)
+
+            # go to next mission
+            self.pub_mission.publish(self.Mission.Construction.value)
+
+    def main(self):
+        rospy.spin()
+
+if __name__ == '__main__':
+    rospy.init_node('detect_intersection_yolo')
+    node = DetectSign()
+    node.main()
